@@ -1,0 +1,24 @@
+# NFL Score Prediction Model Requirements
+# Compatible with Python 3.12 on Windows
+# All packages use wheels for faster installation
+
+# Core data science libraries
+numpy==1.26.4
+pandas==2.2.1
+scikit-learn==1.6.1
+
+# XGBoost for gradient boosting
+xgboost==2.0.3
+
+# NFL data library
+nfl_data_py==0.3.2
+
+# Fast data processing libraries
+pyarrow==15.0.0
+polars==0.20.10
+
+# Visualization
+matplotlib==3.8.3
+
+# Hyperparameter optimization
+optuna==3.6.0
