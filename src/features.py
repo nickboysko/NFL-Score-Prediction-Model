@@ -1,290 +1,187 @@
 """
-Enhanced Feature Engineering Module for NFL Score Prediction
-Focused on improving spread and total prediction accuracy
+Feature Engineering Module for NFL Score Prediction
 
-Key improvements:
-- Market-aware features (line movement, public betting)
-- Advanced team strength metrics 
-- Situational context features
-- Weather impact modeling
-- Injury/roster stability indicators
+This module creates features for the NFL score prediction model,
+including team-level rolling statistics, opponent features, and game context.
 """
 
 import pandas as pd
 import numpy as np
-from datetime import timedelta
 
 
-def create_market_features(df):
+def create_team_features(df):
     """
-    Create market-aware features that capture betting line information.
-    """
-    df = df.copy()
+    Create team-level rolling features and statistics.
     
-    # Market efficiency features
-    df['spread_total_ratio'] = df['spread_line'].abs() / df['total_line'].clip(lower=30)
-    df['heavy_favorite'] = (df['spread_line'].abs() > 7).astype(int)
-    df['pick_em'] = (df['spread_line'].abs() < 3).astype(int)
-    df['high_total'] = (df['total_line'] > 47).astype(int)
-    df['low_total'] = (df['total_line'] < 42).astype(int)
+    Args:
+        df (pd.DataFrame): DataFrame with team-game data
     
-    # Market expectations vs recent performance
-    df['market_over_performance'] = df['pf_avg_3'] - (df['total_line'] / 2)
-    df['spread_expectation_diff'] = df['pf_avg_3'] - df['opp_pa_avg_3'] - np.where(df['is_home'], df['spread_line'], -df['spread_line'])
-    
-    return df
-
-
-def create_advanced_team_metrics(df):
-    """
-    Create advanced team strength and consistency metrics.
+    Returns:
+        pd.DataFrame: DataFrame with engineered features
     """
     df = df.copy()
     
-    # Sort for proper calculations
+    # Sort for proper rolling calculations
     df = df.sort_values(['team', 'date'])
     
-    # Expanded rolling windows
-    WINDOWS = [2, 3, 4, 5, 6, 8, 10, 16]
+    # Expanded rolling windows for feature calculation
+    WINDOWS = [1, 2, 3, 4, 5, 6, 8, 10]
     
+    # Calculate rolling offensive and defensive statistics
     for w in WINDOWS:
-        # Consistency metrics (lower std = more consistent)
-        df[f'consistency_pf_{w}'] = df.groupby('team')['points_for'].transform(
-            lambda s: 1 / (1 + s.shift(1).rolling(w, min_periods=2).std().fillna(10))
+        # Offensive form (points scored)
+        df[f'pf_avg_{w}'] = df.groupby('team')['points_for'].transform(
+            lambda s: s.shift(1).rolling(w, min_periods=1).mean()
         )
-        df[f'consistency_pa_{w}'] = df.groupby('team')['points_against'].transform(
-            lambda s: 1 / (1 + s.shift(1).rolling(w, min_periods=2).std().fillna(10))
+        df[f'pf_std_{w}'] = df.groupby('team')['points_for'].transform(
+            lambda s: s.shift(1).rolling(w, min_periods=1).std()
         )
         
-        # Point differential trends
-        df[f'point_diff_avg_{w}'] = df.groupby('team').apply(
-            lambda x: (x['points_for'] - x['points_against']).shift(1).rolling(w, min_periods=1).mean()
-        ).reset_index(level=0, drop=True)
-        
-        # Weighted recent performance (more weight on recent games)
-        weights = np.exp(np.linspace(-1, 0, w))
-        weights = weights / weights.sum()
-        
-        def weighted_mean(series, weights):
-            if len(series) < len(weights):
-                weights = weights[-len(series):]
-                weights = weights / weights.sum()
-            return np.average(series, weights=weights)
-        
-        df[f'weighted_pf_{w}'] = df.groupby('team')['points_for'].transform(
-            lambda s: s.shift(1).rolling(w, min_periods=1).apply(lambda x: weighted_mean(x, weights))
+        # Defensive form (points allowed)
+        df[f'pa_avg_{w}'] = df.groupby('team')['points_against'].transform(
+            lambda s: s.shift(1).rolling(w, min_periods=1).mean()
         )
-        df[f'weighted_pa_{w}'] = df.groupby('team')['points_against'].transform(
-            lambda s: s.shift(1).rolling(w, min_periods=1).apply(lambda x: weighted_mean(x, weights))
+        df[f'pa_std_{w}'] = df.groupby('team')['points_against'].transform(
+            lambda s: s.shift(1).rolling(w, min_periods=1).std()
         )
     
-    # Momentum indicators
-    df['recent_momentum'] = df.groupby('team').apply(
-        lambda x: ((x['points_for'] - x['points_against']).shift(1).rolling(3).mean() - 
-                  (x['points_for'] - x['points_against']).shift(4).rolling(3).mean())
+    # Create opponent features by merging team stats
+    opponent_cols = [f'pf_avg_{w}' for w in WINDOWS] + [f'pa_avg_{w}' for w in WINDOWS]
+    
+    # Merge opponent features
+    df = df.merge(
+        df[['team', 'date'] + opponent_cols].rename(
+            columns={c: f'opp_{c}' for c in opponent_cols}
+        ),
+        left_on=['opp', 'date'], 
+        right_on=['team', 'date'], 
+        how='left', 
+        suffixes=('', '_drop')
+    ).drop(columns=['team_drop'])
+    
+    # Game context features
+    df['rest_days'] = df.apply(
+        lambda r: r['home_rest'] if r['is_home'] else r['away_rest'], 
+        axis=1
+    )
+    
+    # Neutral site flag
+    df['neutral'] = (df['location'].str.contains('Neutral', case=False, na=False)).astype(int)
+    
+    # Encode roof and surface features
+    for col in ['roof', 'surface']:
+        df[col] = df[col].fillna('UNK')
+    
+    # Calculate win/loss from points (for win streaks)
+    df['won'] = (df['points_for'] > df['points_against']).astype(int)
+    
+    # Win streaks (using calculated win/loss)
+    df['win_streak'] = df.groupby('team').apply(
+        lambda x: x['won'].shift(1).rolling(5, min_periods=1).sum()
     ).reset_index(level=0, drop=True)
     
-    # Strength of schedule
-    df['sos_pf'] = df.groupby('team')['opp_pa_avg_5'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
-    df['sos_pa'] = df.groupby('team')['opp_pf_avg_5'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
+    # Loss streaks
+    df['loss_streak'] = df.groupby('team').apply(
+        lambda x: ((1 - x['won']).shift(1).rolling(5, min_periods=1).sum())
+    ).reset_index(level=0, drop=True)
+    
+    # Recent performance trends
+    df['recent_form'] = df.groupby('team').apply(
+        lambda x: x['won'].shift(1).rolling(5, min_periods=1).mean()
+    ).reset_index(level=0, drop=True)
+    
+    # Season progression
+    df['games_played'] = df.groupby(['team', 'season']).cumcount()
+    df['season_progress'] = df['games_played'] / 17  # Percentage through season
+    
+    # Rest advantage
+    df['rest_differential'] = df['home_rest'] - df['away_rest']
+    
+    # Enhanced surface and roof impact
+    df['dome_game'] = (df['roof'].str.lower().isin(['dome', 'closed'])).astype(int)
+    df['outdoor_game'] = (df['roof'].str.lower() == 'outdoors').astype(int)
+    df['turf_game'] = (df['surface'].str.lower() == 'turf').astype(int)
+    
+    # Add offensive vs defensive matchups
+    df['off_vs_def'] = df['pf_avg_5'] - df['opp_pa_avg_5']  # How team's offense matches opponent's defense
+    df['def_vs_off'] = df['pa_avg_5'] - df['opp_pf_avg_5']  # How team's defense matches opponent's offense
+    
+    # Pace of play
+    df['total_avg_5'] = (df['pf_avg_5'] + df['pa_avg_5'])  # Team's average total points in games
+    df['opp_total_avg_5'] = (df['opp_pf_avg_5'] + df['opp_pa_avg_5'])  # Opponent's average total
     
     return df
 
 
-def create_situational_features(df):
+def create_game_features(df):
     """
-    Create situational context features that affect game outcomes.
+    Create game-level features and context.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with team-game data
+    
+    Returns:
+        pd.DataFrame: DataFrame with game-level features
     """
     df = df.copy()
     
-    # Advanced rest analysis
-    df['rest_bucket'] = pd.cut(df['rest_days'], bins=[0, 6, 7, 10, 14, 30], 
-                              labels=['short', 'normal', 'long', 'bye_week', 'very_long'])
-    df['rest_bucket'] = df['rest_bucket'].astype(str)
+    # Week-based features
+    df['early_season'] = (df['week'] <= 4).astype(int)
+    df['late_season'] = (df['week'] >= 15).astype(int)
+    df['mid_season'] = ((df['week'] > 4) & (df['week'] < 15)).astype(int)
     
-    # Divisional games
-    # Simple heuristic: if teams are in same division, they play twice
-    df['div_game'] = df.groupby(['team', 'opp', 'season']).cumcount().apply(lambda x: 1 if x > 0 else 0)
+    # Game type features
+    df['is_playoff'] = (df['game_type'] == 'POST').astype(int)
+    df['is_regular_season'] = (df['game_type'] == 'REG').astype(int)
     
-    # Travel distance proxy (coast-to-coast games)
-    east_teams = ['BUF', 'MIA', 'NE', 'NYJ', 'BAL', 'CIN', 'CLE', 'PIT', 'HOU', 'IND', 'JAX', 'TEN',
-                  'ATL', 'CAR', 'NO', 'TB', 'DAL', 'NYG', 'PHI', 'WAS']
-    west_teams = ['DEN', 'KC', 'LV', 'LAC', 'ARI', 'LAR', 'SF', 'SEA']
+    # Playoff race implications (weeks 15-18)
+    df['playoff_race'] = ((df['week'] >= 15) & (df['game_type'] == 'REG')).astype(int)
     
-    df['team_coast'] = df['team'].apply(lambda x: 'east' if x in east_teams else ('west' if x in west_teams else 'central'))
-    df['opp_coast'] = df['opp'].apply(lambda x: 'east' if x in east_teams else ('west' if x in west_teams else 'central'))
-    df['cross_country'] = ((df['team_coast'] == 'east') & (df['opp_coast'] == 'west') |
-                          (df['team_coast'] == 'west') & (df['opp_coast'] == 'east')).astype(int)
+    # Overtime games
+    df['went_overtime'] = (df['overtime'] == 1).astype(int)
     
-    # Time zone impact
-    df['west_to_east'] = ((df['team_coast'] == 'west') & (df['opp_coast'] == 'east') & (df['is_home'] == 0)).astype(int)
-    df['east_to_west'] = ((df['team_coast'] == 'east') & (df['opp_coast'] == 'west') & (df['is_home'] == 0)).astype(int)
-    
-    # Playoff implications
-    df['must_win'] = ((df['week'] >= 15) & (df['game_type'] == 'REG')).astype(int)
-    df['meaningless'] = ((df['week'] == 18) & (df['game_type'] == 'REG')).astype(int)  # Week 18 can have resting starters
-    
-    # Thursday/Monday night effects
-    df['short_week'] = (df['gameday'] == 'Thursday').astype(int)
-    df['monday_night'] = (df['gameday'] == 'Monday').astype(int)
-    df['prime_time'] = df['short_week'] + df['monday_night']
+    # Home field advantage (could be enhanced with historical data)
+    df['home_advantage'] = df['is_home'].astype(int)
     
     return df
 
 
-def create_weather_features(df):
+def create_all_features(df):
     """
-    Create weather-related features (simplified version without real weather data).
+    Create all features by running both team and game feature functions.
+    
+    Args:
+        df (pd.DataFrame): Raw DataFrame from data_loader.load_schedules()
+    
+    Returns:
+        pd.DataFrame: DataFrame with all engineered features
     """
-    df = df.copy()
+    print("Creating team-level features...")
+    df = create_team_features(df)
     
-    # Month-based weather proxy
-    df['month'] = pd.to_datetime(df['gameday']).dt.month
-    df['cold_weather'] = ((df['month'].isin([12, 1, 2])) & (df['roof'] == 'outdoors')).astype(int)
-    df['hot_weather'] = ((df['month'].isin([9])) & (df['roof'] == 'outdoors')).astype(int)
+    print("Creating game-level features...")
+    df = create_game_features(df)
     
-    # Stadium type effects on totals
-    df['dome_boost'] = (df['roof'].str.lower().isin(['dome', 'closed'])).astype(int)
-    df['weather_game'] = ((df['roof'] == 'outdoors') & (df['month'].isin([11, 12, 1, 2]))).astype(int)
-    
-    return df
-
-
-def create_matchup_features(df):
-    """
-    Create advanced matchup-specific features.
-    """
-    df = df.copy()
-    
-    # Style matchups
-    df['pace_matchup'] = (df['pf_avg_5'] + df['pa_avg_5']) + (df['opp_pf_avg_5'] + df['opp_pa_avg_5'])
-    df['defensive_game'] = ((df['pa_avg_5'] < 20) & (df['opp_pa_avg_5'] < 20)).astype(int)
-    df['shootout_potential'] = ((df['pf_avg_5'] > 25) & (df['opp_pf_avg_5'] > 25)).astype(int)
-    
-    # Strength vs weakness matchups
-    df['off_vs_def_percentile'] = df.groupby(['season', 'week'])['off_vs_def'].transform(
-        lambda x: x.rank(pct=True)
-    )
-    df['elite_vs_poor'] = ((df['off_vs_def_percentile'] > 0.8) | (df['off_vs_def_percentile'] < 0.2)).astype(int)
-    
-    # Historical head-to-head (simplified)
-    df['rivalry_game'] = df.groupby(['team', 'opp']).cumcount().apply(lambda x: min(x, 5) / 5)
-    
-    return df
-
-
-def create_trend_features(df):
-    """
-    Create trend-based features for recent performance patterns.
-    """
-    df = df.copy()
-    df = df.sort_values(['team', 'date'])
-    
-    # Cover rate trends
-    for w in [3, 5, 8]:
-        # Points vs spread trend
-        df[f'recent_cover_rate_{w}'] = df.groupby('team').apply(
-            lambda team_df: (
-                (team_df['points_for'].shift(1) - team_df['points_against'].shift(1) - 
-                 np.where(team_df['is_home'], team_df['spread_line'], -team_df['spread_line']).shift(1)) > 0
-            ).rolling(w, min_periods=1).mean()
-        ).reset_index(level=0, drop=True)
-        
-        # Over/under trend
-        df[f'recent_over_rate_{w}'] = df.groupby('team').apply(
-            lambda team_df: (
-                (team_df['points_for'].shift(1) + team_df['points_against'].shift(1) - 
-                 team_df['total_line'].shift(1)) > 0
-            ).rolling(w, min_periods=1).mean()
-        ).reset_index(level=0, drop=True)
-    
-    # Scoring trend direction
-    df['scoring_trend'] = df.groupby('team')['points_for'].transform(
-        lambda s: s.shift(1).rolling(4).apply(lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) >= 2 else 0)
-    )
-    df['allow_trend'] = df.groupby('team')['points_against'].transform(
-        lambda s: s.shift(1).rolling(4).apply(lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) >= 2 else 0)
-    )
-    
-    return df
-
-
-def create_market_timing_features(df):
-    """
-    Create features that capture market timing and line movement patterns.
-    """
-    df = df.copy()
-    
-    # Line value indicators (simplified - would need actual line movement data)
-    df['spread_magnitude'] = df['spread_line'].abs()
-    df['total_level'] = pd.cut(df['total_line'], 
-                              bins=[0, 40, 44, 47, 50, 100], 
-                              labels=['very_low', 'low', 'medium', 'high', 'very_high'])
-    df['total_level'] = df['total_level'].astype(str)
-    
-    # Key numbers in spread betting
-    df['key_number_spread'] = df['spread_line'].abs().isin([3, 6, 7, 10, 14]).astype(int)
-    df['key_number_total'] = df['total_line'].isin([41, 42, 43, 44, 47, 48, 49, 50, 51]).astype(int)
-    
-    return df
-
-
-def create_all_enhanced_features(df):
-    """
-    Create all enhanced features for improved betting accuracy.
-    """
-    print("Creating enhanced features for betting accuracy...")
-    
-    print("  - Market features...")
-    df = create_market_features(df)
-    
-    print("  - Advanced team metrics...")
-    df = create_advanced_team_metrics(df)
-    
-    print("  - Situational features...")
-    df = create_situational_features(df)
-    
-    print("  - Weather features...")
-    df = create_weather_features(df)
-    
-    print("  - Matchup features...")
-    df = create_matchup_features(df)
-    
-    print("  - Trend features...")
-    df = create_trend_features(df)
-    
-    print("  - Market timing features...")
-    df = create_market_timing_features(df)
-    
-    print("✅ Enhanced feature engineering complete!")
+    print("Feature engineering complete!")
     print(f"Final shape: {df.shape}")
+    print(f"Total features created: {len([col for col in df.columns if col not in ['game_id', 'season', 'week', 'gameday', 'gametime', 'game_type', 'team', 'opp', 'points_for', 'points_against', 'is_home', 'date', 'season_week', 'location', 'overtime', 'spread_line', 'total_line', 'home_moneyline', 'away_moneyline', 'home_rest', 'away_rest', 'surface', 'roof']])}")
     
     return df
 
 
 if __name__ == "__main__":
-    # Test enhanced features
-    from data_loader import load_schedules
-    from features import create_all_features
+    print("Feature engineering module - testing feature creation...")
     
+    # Test with sample data
+    from data_loader import load_schedules
+    
+    # Load a small sample for testing
     print("Loading sample data...")
     sample_data = load_schedules([2023])
     
-    print("Creating base features...")
-    base_featured = create_all_features(sample_data)
+    print("Creating features...")
+    featured_data = create_all_features(sample_data)
     
-    print("Creating enhanced features...")
-    enhanced_featured = create_all_enhanced_features(base_featured)
-    
-    print(f"\nFeature count comparison:")
-    print(f"Base features: {base_featured.shape[1]}")
-    print(f"Enhanced features: {enhanced_featured.shape[1]}")
-    print(f"New features added: {enhanced_featured.shape[1] - base_featured.shape[1]}")
-    
-    # Show sample of new features
-    new_cols = set(enhanced_featured.columns) - set(base_featured.columns)
-    print(f"\nSample of new enhanced features:")
-    for i, col in enumerate(sorted(new_cols)):
-        if i < 10:  # Show first 10
-            print(f"  - {col}")
-    print(f"  ... and {len(new_cols) - 10} more")
+    print("\nSample of engineered features:")
+    feature_cols = [col for col in featured_data.columns if any(x in col for x in ['pf_avg', 'pa_avg', 'opp_', 'rest_days', 'neutral', 'win_streak', 'recent_form'])]
+    print(featured_data[['team', 'opp', 'date'] + feature_cols].head())
