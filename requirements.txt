@@ -22,3 +22,7 @@ matplotlib==3.8.3
 
 # Hyperparameter optimization
 optuna==3.6.0
+
+# Additional ML libraries (required by optuna and model functions)
+lightgbm>=3.3.0
+scipy>=1.9.0
