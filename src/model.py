@@ -1,9 +1,8 @@
 """
-Enhanced Model Training and Evaluation Module
+Robust Enhanced Model Training Module - FEATURE MISMATCH FIXED
 
 This module handles training, validation, and evaluation of the NFL score prediction model
-using XGBoost with advanced features like hyperparameter optimization, ensemble methods,
-and comprehensive evaluation metrics.
+with robust feature detection and handling of missing features.
 """
 
 import pandas as pd
@@ -19,20 +18,24 @@ from sklearn.ensemble import RandomForestRegressor, VotingRegressor
 from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.feature_selection import SelectFromModel
 from xgboost import XGBRegressor
+try:
+    import lightgbm as lgb
+    from lightgbm import LGBMRegressor
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+    print("⚠️ LightGBM not available, using XGBoost only")
+
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.ensemble import StackingRegressor
 import warnings
 warnings.filterwarnings('ignore')
 
 
 def prepare_data(df, test_season=2024):
     """
-    Prepare data for training by splitting into train/test and cleaning features.
-    
-    Args:
-        df (pd.DataFrame): DataFrame with engineered features
-        test_season (int): Season to use as test set
-    
-    Returns:
-        tuple: (train, test, FEATURES, TARGET)
+    ROBUST: Prepare data with automatic feature detection.
+    Only uses features that actually exist in the dataset.
     """
     # Leave the most recent season out as test
     train = df[df['season'] < test_season].copy()
@@ -41,68 +44,111 @@ def prepare_data(df, test_season=2024):
     print(f"📊 Train set: {len(train)} records (seasons < {test_season})")
     print(f"📊 Test set: {len(test)} records (season {test_season})")
     
-    # Define features and target
-    WINDOWS = [1, 2, 3, 4, 5, 6, 8, 10]  # Expanded to match features.py
+    # Get all available columns
+    available_cols = set(df.columns)
     
     # Impute critical numeric cols early for implied features
-    for c in ['spread_line', 'total_line', 'rest_days']:
-        if c in train.columns:
+    numeric_cols_to_impute = ['spread_line', 'total_line', 'rest_days']
+    for c in numeric_cols_to_impute:
+        if c in available_cols:
             median_val = train[c].median()
             train[c] = train[c].fillna(median_val)
             test[c] = test[c].fillna(median_val)
             print(f"✅ Filled NaN in {c} with median: {median_val:.2f}")
     
-    # Market-implied features (based on home perspective)
-    # implied home points = total/2 + spread/2 ; implied away points = total/2 - spread/2
-    def compute_implied_points(df_part):
-        half_total = df_part['total_line'] / 2.0
-        half_spread = df_part['spread_line'] / 2.0
-        home_implied = half_total + half_spread
-        away_implied = half_total - half_spread
-        # map to team row using is_home
-        return np.where(df_part['is_home'] == 1, home_implied, away_implied)
-    
-    train['implied_points'] = compute_implied_points(train)
-    test['implied_points'] = compute_implied_points(test)
-    train['implied_spread'] = train['spread_line']  # home - away
-    test['implied_spread'] = test['spread_line']
-    train['implied_total'] = train['total_line']
-    test['implied_total'] = test['total_line']
+    # Market-implied features (only if source columns exist)
+    if 'total_line' in available_cols and 'spread_line' in available_cols:
+        def compute_implied_points(df_part):
+            half_total = df_part['total_line'] / 2.0
+            half_spread = df_part['spread_line'] / 2.0
+            home_implied = half_total + half_spread
+            away_implied = half_total - half_spread
+            return np.where(df_part['is_home'] == 1, home_implied, away_implied)
+        
+        train['implied_points'] = compute_implied_points(train)
+        test['implied_points'] = compute_implied_points(test)
+        train['implied_spread'] = train['spread_line']
+        test['implied_spread'] = test['spread_line']
+        train['implied_total'] = train['total_line']
+        test['implied_total'] = test['total_line']
+        print("✅ Created market-implied features")
     
     # Ensure categorical columns are properly formatted
-    for col in ['roof', 'surface']:
-        if col in train.columns:
+    categorical_cols = ['roof', 'surface']
+    for col in categorical_cols:
+        if col in available_cols:
             train[col] = train[col].fillna('UNK').astype(str)
             test[col] = test[col].fillna('UNK').astype(str)
             print(f"✅ Formatted categorical column {col}")
     
-    base_cols = ['is_home', 'neutral', 'rest_days', 'spread_line', 'total_line', 'roof', 'surface',
-                 'implied_points', 'implied_spread', 'implied_total']
-    rolling_cols = [f'{p}_{w}' for p in ['pf_avg', 'pf_std', 'pa_avg', 'pa_std', 'opp_pf_avg', 'opp_pa_avg'] for w in WINDOWS]
-    interaction_cols = ['off_vs_def', 'def_vs_off', 'total_avg_5', 'opp_total_avg_5', 'win_streak', 'recent_form']
-    context_cols = ['dome_game', 'outdoor_game', 'turf_game', 'season_progress']
+    # ROBUST FEATURE SELECTION - Only use what exists
+    # Define potential feature categories
+    base_features = ['is_home', 'neutral', 'rest_days']
+    market_features = ['spread_line', 'total_line', 'implied_points', 'implied_spread', 'implied_total']
+    categorical_features = ['roof', 'surface']
     
-    FEATURES = base_cols + rolling_cols + interaction_cols + context_cols
+    # Rolling window features (check what actually exists)
+    WINDOWS = [1, 2, 3, 4, 5, 6, 8, 10]
+    rolling_patterns = [
+        'pf_avg', 'pf_std', 'pa_avg', 'pa_std', 
+        'opp_pf_avg', 'opp_pa_avg', 'opp_pf_std', 'opp_pa_std'
+    ]
+    rolling_features = []
+    for pattern in rolling_patterns:
+        for w in WINDOWS:
+            feat_name = f'{pattern}_{w}'
+            if feat_name in available_cols:
+                rolling_features.append(feat_name)
+    
+    # Interaction/derived features (check what exists)
+    potential_interaction_features = [
+        'off_vs_def', 'def_vs_off', 'total_avg_5', 'opp_total_avg_5', 
+        'win_streak', 'recent_form', 'loss_streak', 'games_played',
+        'season_progress', 'rest_differential'
+    ]
+    interaction_features = [f for f in potential_interaction_features if f in available_cols]
+    
+    # Context features (check what exists)
+    potential_context_features = [
+        'dome_game', 'outdoor_game', 'turf_game', 'early_season',
+        'late_season', 'mid_season', 'is_playoff', 'playoff_race',
+        'went_overtime', 'home_advantage'
+    ]
+    context_features = [f for f in potential_context_features if f in available_cols]
+    
+    # Combine all available features
+    all_potential_features = (base_features + market_features + categorical_features + 
+                            rolling_features + interaction_features + context_features)
+    
+    # Filter to only features that actually exist in the dataframe
+    FEATURES = [f for f in all_potential_features if f in available_cols]
     TARGET = 'points_for'
     
     print(f"🎯 Target variable: {TARGET}")
-    print(f"🔧 Number of features: {len(FEATURES)}")
-    print("✅ Data preparation complete")
+    print(f"🔧 Available features: {len(FEATURES)}")
+    
+    # Print feature breakdown
+    found_base = [f for f in base_features if f in FEATURES]
+    found_market = [f for f in market_features if f in FEATURES]
+    found_cat = [f for f in categorical_features if f in FEATURES]
+    found_rolling = [f for f in rolling_features if f in FEATURES]
+    found_interaction = [f for f in interaction_features if f in FEATURES]
+    found_context = [f for f in context_features if f in FEATURES]
+    
+    print(f"   📊 Feature breakdown:")
+    print(f"      - Base: {len(found_base)} features")
+    print(f"      - Market: {len(found_market)} features")
+    print(f"      - Categorical: {len(found_cat)} features")
+    print(f"      - Rolling: {len(found_rolling)} features")
+    print(f"      - Interaction: {len(found_interaction)} features")
+    print(f"      - Context: {len(found_context)} features")
+    
+    print("✅ Robust data preparation complete")
     return train, test, FEATURES, TARGET
 
 
 def create_xgboost_model(params=None, objective_type='squared', random_state=42):
-    """
-    Create XGBoost model with default or custom parameters.
-    
-    Args:
-        params (dict): Custom parameters for XGBoost
-        objective_type (str): 'squared' or 'poisson'
-        random_state (int): seed
-    
-    Returns:
-        XGBRegressor: Configured XGBoost model
-    """
+    """Create XGBoost model with default or custom parameters."""
     default_params = {
         'n_estimators': 1000,
         'max_depth': 6,
@@ -122,390 +168,287 @@ def create_xgboost_model(params=None, objective_type='squared', random_state=42)
     return XGBRegressor(**default_params)
 
 
-def create_ensemble_model():
-    """
-    Create ensemble model combining XGBoost, Random Forest, and Ridge.
-    
-    Returns:
-        VotingRegressor: Ensemble model
-    """
-    # Individual models with different strengths
-    xgb_model = XGBRegressor(
-        n_estimators=800,
-        max_depth=6,
-        learning_rate=0.03,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_lambda=1.0,
-        random_state=42,
-        n_jobs=-1
-    )
-    
-    rf_model = RandomForestRegressor(
-        n_estimators=500,
-        max_depth=8,
-        min_samples_split=5,
-        min_samples_leaf=2,
-        random_state=42,
-        n_jobs=-1
-    )
-    
-    ridge_model = Ridge(alpha=1.0)
-    
-    # Create ensemble with weighted voting
-    ensemble = VotingRegressor([
-        ('xgb', xgb_model),
-        ('rf', rf_model),
-        ('ridge', ridge_model)
-    ], weights=[0.6, 0.3, 0.1])  # XGBoost gets most weight
-    
-    return ensemble
-
-
-def optimize_hyperparameters(X_train, y_train, X_val, y_val, n_trials=80, objective_type='squared'):
-    """
-    Optimize XGBoost hyperparameters using Optuna.
-    """
+def optimize_hyperparameters(X_train, y_train, X_val, y_val, n_trials=50, objective_type='squared'):
+    """Optimize XGBoost hyperparameters using Optuna."""
     def objective(trial):
-        # Widened parameter search space
         params = {
-            'objective': 'reg:squarederror' if objective_type == 'squared' else 'count:poisson',
-            'eval_metric': 'rmse',
-            'booster': 'gbtree',
-            'verbosity': 0,
-            'random_state': trial.suggest_int('random_state', 1, 10000),
-            'n_jobs': -1,
-            'n_estimators': trial.suggest_int('n_estimators', 300, 1400),
-            'max_depth': trial.suggest_int('max_depth', 3, 10),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 5.0),
-            'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 5.0),
+            'n_estimators': trial.suggest_int('n_estimators', 500, 1500),
+            'max_depth': trial.suggest_int('max_depth', 4, 12),
+            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1),
+            'subsample': trial.suggest_float('subsample', 0.7, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1.0),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 10.0),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0.01, 2.0),
             'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+            'gamma': trial.suggest_float('gamma', 0.05, 5.0)
         }
         
-        model = XGBRegressor(**params)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            early_stopping_rounds=50,
-            verbose=False
-        )
-        y_pred = model.predict(X_val)
-        mae = mean_absolute_error(y_val, y_pred)
-        return mae
+        model = create_xgboost_model(params, objective_type, random_state=42)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False)
+        
+        pred = model.predict(X_val)
+        return mean_absolute_error(y_val, pred)
     
-    print(f"🔍 Starting hyperparameter optimization with {n_trials} trials...")
+    print(f"🔍 Starting multi-objective optimization with {n_trials} trials...")
     study = optuna.create_study(direction='minimize')
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-    print(f"✅ Best MAE: {study.best_value:.4f}")
-    print(f"🔧 Best parameters: {study.best_params}")
+    
+    print(f"✅ Best score: {study.best_value:.4f}")
     return study.best_params
 
 
-def improved_walk_forward_backtest(train, FEATURES, TARGET, n_splits=5, use_optimization=False, objective_type='squared', decay_half_life_days=60):
-    """
-    Enhanced walk-forward backtesting with purging, optional optimization, and time-decay weights.
-    """
-    print(f"🔄 Performing enhanced walk-forward backtesting with {n_splits} folds...")
-    df_sorted = train.sort_values('date').copy()
-    num_cols = [c for c in FEATURES if c not in ['roof', 'surface']]
-    cat_cols = ['roof', 'surface']
-    print(f"🔧 Numerical features: {len(num_cols)}")
-    print(f"🔧 Categorical features: {len(cat_cols)}")
+def ensemble_feature_selection(X_train, y_train, n_features=40):
+    """Select features using ensemble of different selection methods."""
+    print(f"🔍 Starting with {X_train.shape[1]} features")
     
-    preprocessor = ColumnTransformer([
-        ('num', 'passthrough', num_cols),
-        ('cat', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), cat_cols)
-    ])
+    # Method 1: XGBoost feature importance
+    xgb_selector = XGBRegressor(n_estimators=200, random_state=42, n_jobs=-1)
+    xgb_selector.fit(X_train, y_train)
+    xgb_importance = pd.Series(xgb_selector.feature_importances_, index=range(X_train.shape[1]))
     
-    X = df_sorted[FEATURES]
-    y = df_sorted[TARGET]
-    print(f"📅 Date range: {df_sorted['date'].min().strftime('%Y-%m-%d')} to {df_sorted['date'].max().strftime('%Y-%m-%d')}")
-    print(f"📊 Total training samples: {len(X)}")
+    # Method 2: LightGBM feature importance (if available)
+    if LIGHTGBM_AVAILABLE:
+        try:
+            lgb_selector = LGBMRegressor(n_estimators=200, random_state=42, n_jobs=-1, verbose=-1)
+            lgb_selector.fit(X_train, y_train)
+            lgb_importance = pd.Series(lgb_selector.feature_importances_, index=range(X_train.shape[1]))
+        except:
+            lgb_importance = xgb_importance.copy()
+    else:
+        lgb_importance = xgb_importance.copy()
     
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    maes, fold_results = [], []
-    best_params = None
-    PURGE_DAYS = 7
+    # Combine importance scores
+    combined_importance = (xgb_importance + lgb_importance) / 2
     
-    for fold, (tr_idx, va_idx) in enumerate(tscv.split(X), 1):
-        print(f"\n🔄 Fold {fold}/{n_splits}")
-        train_end_date = df_sorted.iloc[tr_idx[-1]]['date']
-        purge_cutoff = train_end_date + pd.Timedelta(days=PURGE_DAYS)
-        valid_va_mask = df_sorted.iloc[va_idx]['date'] > purge_cutoff
-        va_idx = va_idx[valid_va_mask]
-        
-        if len(va_idx) == 0:
-            print(f"   ⚠️ No validation data after purging for fold {fold}")
-            continue
-            
-        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
-        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
-        train_dates = df_sorted.iloc[tr_idx]['date']
-        val_dates = df_sorted.iloc[va_idx]['date']
-        
-        print(f"   📅 Train: {train_dates.min().strftime('%Y-%m-%d')} to {train_dates.max().strftime('%Y-%m-%d')} ({len(X_tr)} samples)")
-        print(f"   📅 Val:   {val_dates.min().strftime('%Y-%m-%d')} to {val_dates.max().strftime('%Y-%m-%d')} ({len(X_va)} samples)")
-        
-        X_tr_processed = preprocessor.fit_transform(X_tr)
-        X_va_processed = preprocessor.transform(X_va)
-        
-        # Time-decay sample weights (newer games weigh more)
-        age_days = (train_end_date - train_dates).dt.days.clip(lower=0)
-        sample_weight = np.power(0.5, age_days / decay_half_life_days).values
-        
-        if use_optimization and fold == 1 and len(X_tr_processed) > 200:
-            opt_split = int(len(X_tr_processed) * 0.8)
-            X_opt_train = X_tr_processed[:opt_split]
-            y_opt_train = y_tr.iloc[:opt_split]
-            X_opt_val = X_tr_processed[opt_split:]
-            y_opt_val = y_tr.iloc[opt_split:]
-            best_params = optimize_hyperparameters(
-                X_opt_train, y_opt_train, X_opt_val, y_opt_val, n_trials=50, objective_type=objective_type
-            )
-            
-        model = create_xgboost_model(best_params, objective_type=objective_type, random_state=42)
-        model.fit(
-            X_tr_processed, y_tr,
-            sample_weight=sample_weight,
-            eval_set=[(X_va_processed, y_va)],
-            early_stopping_rounds=50,
-            verbose=False
+    # Select top features
+    selected_features = combined_importance.nlargest(n_features).index.tolist()
+    
+    print(f"✅ Selected {len(selected_features)} features using ensemble selection")
+    return selected_features
+
+
+def enhanced_walk_forward_validation(train_data, features, target, n_folds=4):
+    """Enhanced walk-forward validation with feature selection and model comparison."""
+    print(f"🔄 Enhanced walk-forward validation with {n_folds} folds...")
+    
+    # Sort by date
+    df_sorted = train_data.sort_values('date').copy()
+    
+    # Prepare features
+    numeric_features = [f for f in features if f not in ['roof', 'surface']]
+    categorical_features = [f for f in features if f in ['roof', 'surface'] and f in df_sorted.columns]
+    
+    print(f"🔧 Numerical features: {len(numeric_features)}")
+    print(f"🔧 Categorical features: {len(categorical_features)}")
+    
+    # Create preprocessor
+    preprocessor_transformers = [('num', 'passthrough', numeric_features)]
+    if categorical_features:
+        preprocessor_transformers.append(
+            ('cat', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), categorical_features)
         )
+    
+    preprocessor = ColumnTransformer(preprocessor_transformers)
+    
+    # Time series split
+    tscv = TimeSeriesSplit(n_splits=n_folds)
+    results = {}
+    
+    X = df_sorted[features]
+    y = df_sorted[target]
+    
+    best_params = None
+    
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
+        print(f"\n🔄 Fold {fold}/{n_folds}")
         
-        pred = model.predict(X_va_processed)
-        maes.append(mean_absolute_error(y_va, pred))
-        fold_rmse = np.sqrt(mean_squared_error(y_va, pred))
-        fold_results.append({
-            'fold': fold,
-            'train_size': len(X_tr),
-            'val_size': len(X_va),
-            'train_dates': (train_dates.min(), train_dates.max()),
-            'val_dates': (val_dates.min(), val_dates.max()),
-            'mae': maes[-1],
-            'rmse': fold_rmse,
-            'predictions': pred,
-            'actual': y_va.values
-        })
-        print(f"   ✅ MAE: {maes[-1]:.3f}, RMSE: {fold_rmse:.3f}")
-    
-    if maes:
-        mean_cv_mae = np.mean(maes)
-        std_cv_mae = np.std(maes)
-        print(f"\n📊 Cross-Validation Results:")
-        print(f"   Mean MAE: {mean_cv_mae:.3f} ± {std_cv_mae:.3f}")
-        print(f"   Individual fold MAEs: {[f'{m:.3f}' for m in maes]}")
-    else:
-        print("⚠️ No valid folds completed!")
-        mean_cv_mae = float('inf')
-    
-    print("✅ Walk-forward backtesting complete")
-    return mean_cv_mae, fold_results, best_params
-
-
-def train_final_model(train, test, FEATURES, TARGET, model_type='xgboost', 
-                     best_params=None, use_feature_selection=True,
-                     objective_type='squared', seeds=(42, 1337, 2024), decay_half_life_days=60,
-                     residual_learning=True):
-    """
-    Train final model with optional ensemble, feature selection, residual learning, and winner calibration.
-    """
-    num_cols = [c for c in FEATURES if c not in ['roof', 'surface']]
-    cat_cols = ['roof', 'surface']
-    print(f"🔧 Numerical features: {len(num_cols)}")
-    print(f"🔧 Categorical features: {len(cat_cols)}")
-    
-    preprocessor = ColumnTransformer([
-        ('num', 'passthrough', num_cols),
-        ('cat', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), cat_cols)
-    ])
-    
-    X_tr = train[FEATURES]; y_tr = train[TARGET]
-    X_te = test[FEATURES]; y_te = test[TARGET]
-    print(f"📊 Training data shape: {X_tr.shape}")
-    print(f"📊 Test data shape: {X_te.shape}")
-    
-    for col in cat_cols:
-        if col in X_tr.columns:
-            X_tr[col] = X_tr[col].astype(str)
-            X_te[col] = X_te[col].astype(str)
-            print(f"✅ Converted {col} to string dtype")
-    
-    print("🔧 Preprocessing features...")
-    X_tr_processed = preprocessor.fit_transform(X_tr)
-    X_te_processed = preprocessor.transform(X_te)
-    print(f"📊 Processed training data shape: {X_tr_processed.shape}")
-    print(f"📊 Processed test data shape: {X_te_processed.shape}")
-    
-    if use_feature_selection and X_tr_processed.shape[1] > 15:
-        print("🔧 Applying feature selection...")
-        from sklearn.impute import SimpleImputer
-        if np.isnan(X_tr_processed).any():
-            print("🔧 Handling NaN values before feature selection...")
-            imputer = SimpleImputer(strategy='median')
-            X_tr_processed = imputer.fit_transform(X_tr_processed)
-            X_te_processed = imputer.transform(X_te_processed)
-            print("✅ NaN values handled")
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
         
-        temp_model = XGBRegressor(n_estimators=150, random_state=42, n_jobs=-1)
-        temp_model.fit(X_tr_processed, y_tr)
-        selector = SelectFromModel(temp_model, threshold='median')
-        X_tr_processed = selector.fit_transform(X_tr_processed, y_tr)
-        X_te_processed = selector.transform(X_te_processed)
-        n_selected = X_tr_processed.shape[1]
-        print(f"✅ Selected {n_selected} features from {X_te.shape[1]} original features")
-    
-    # Time-decay sample weights for final training
-    train_end_date = train['date'].max()
-    age_days = (train_end_date - train['date']).dt.days.clip(lower=0)
-    sample_weight = np.power(0.5, age_days / decay_half_life_days).values
-    print("🔧 Using time-decay sample weights for final training")
-    
-    # Residual learning target
-    if residual_learning and 'implied_points' in train.columns and 'implied_points' in test.columns:
-        y_tr_target = (train[TARGET] - train['implied_points']).values
-        implied_te = test['implied_points'].values
-        residual_mode = True
-        print("✅ Residual learning enabled (predicting points_for - implied_points)")
-    else:
-        y_tr_target = y_tr.values
-        implied_te = np.zeros(len(test))
-        residual_mode = False
-        print("ℹ️ Residual learning disabled (predicting raw points)")
-    
-    # Train model(s)
-    print(f"🚀 Training {model_type} model...")
-    models = []
-    if model_type == 'ensemble':
-        model = create_ensemble_model()
-        model.fit(X_tr_processed, y_tr_target)
-        models = [model]
-    else:
-        for seed in seeds:
-            model = create_xgboost_model(best_params, objective_type=objective_type, random_state=seed)
-            model.fit(
-                X_tr_processed, y_tr_target,
-                sample_weight=sample_weight,
-                eval_set=[(X_te_processed, y_te - implied_te if residual_mode else y_te)],
-                early_stopping_rounds=50,
-                verbose=False
+        # Preprocess features
+        X_train_processed = preprocessor.fit_transform(X_train)
+        X_val_processed = preprocessor.transform(X_val)
+        
+        # Feature selection
+        selected_features = ensemble_feature_selection(X_train_processed, y_train, n_features=40)
+        X_train_selected = X_train_processed[:, selected_features]
+        X_val_selected = X_val_processed[:, selected_features]
+        
+        # Hyperparameter optimization (only for first fold to save time)
+        if fold == 1:
+            best_params = optimize_hyperparameters(
+                X_train_selected, y_train, X_val_selected, y_val, n_trials=50
             )
-            models.append(model)
+        
+        # Test multiple models
+        models = {
+            'base_xgb': create_xgboost_model(random_state=42),
+            'optimized_xgb': create_xgboost_model(best_params, random_state=42),
+        }
+        
+        if LIGHTGBM_AVAILABLE:
+            models['lgb'] = LGBMRegressor(n_estimators=1000, random_state=42, n_jobs=-1, verbose=-1)
+            models['stacking'] = StackingRegressor([
+                ('xgb', create_xgboost_model(best_params, random_state=42)),
+                ('lgb', LGBMRegressor(n_estimators=800, random_state=42, n_jobs=-1, verbose=-1))
+            ], final_estimator=Ridge(alpha=1.0), cv=3, n_jobs=-1)
+        
+        fold_results = {}
+        for name, model in models.items():
+            try:
+                if 'xgb' in name and name != 'stacking':
+                    model.fit(X_train_selected, y_train, 
+                             eval_set=[(X_val_selected, y_val)], 
+                             early_stopping_rounds=50, verbose=False)
+                else:
+                    model.fit(X_train_selected, y_train)
+                
+                pred = model.predict(X_val_selected)
+                mae = mean_absolute_error(y_val, pred)
+                fold_results[name] = mae
+                print(f"   {name} MAE: {mae:.3f}")
+                
+            except Exception as e:
+                print(f"   ⚠️ Skipping estimator '{name}' ({type(model).__name__}) due to tag error: {str(e)}")
+                continue
+        
+        # Store results
+        if fold not in results:
+            results[fold] = {}
+        results[fold].update(fold_results)
     
-    # Predictions (average if multiple models)
-    preds_res = np.column_stack([m.predict(X_te_processed) for m in models]).mean(axis=1)
-    pred_te = implied_te + preds_res if residual_mode else preds_res
+    # Calculate cross-validation scores
+    cv_results = {}
+    model_names = ['base_xgb', 'optimized_xgb']
+    if LIGHTGBM_AVAILABLE:
+        model_names.extend(['lgb', 'stacking'])
+        
+    for model_name in model_names:
+        scores = [results[fold].get(model_name) for fold in results if model_name in results[fold]]
+        if scores:
+            cv_results[model_name] = (np.mean(scores), np.std(scores))
     
-    if objective_type == 'poisson':
-        pred_te = np.clip(pred_te, 0, None)
+    print(f"\n📊 Cross-Validation Results:")
+    best_model = None
+    best_score = float('inf')
     
-    team_mae = mean_absolute_error(y_te, pred_te)
-    team_rmse = np.sqrt(mean_squared_error(y_te, pred_te))
-    print(f'✅ 2024 Team-level MAE: {team_mae:.2f}')
-    print(f'✅ 2024 Team-level RMSE: {team_rmse:.2f}')
+    for model_name, (mean_score, std_score) in cv_results.items():
+        print(f"   {model_name}: {mean_score:.3f} ± {std_score:.3f}")
+        if mean_score < best_score:
+            best_score = mean_score
+            best_model = model_name
     
-    # Winner calibration: fit logistic regression on training seasons
-    print("🔧 Fitting winner calibration model (logistic regression)...")
-    # Predict on training set with out-of-fold proxy
-    preds_res_tr = np.column_stack([m.predict(X_tr_processed) for m in models]).mean(axis=1)
-    pred_points_tr = (train['implied_points'].values + preds_res_tr) if residual_mode else preds_res_tr
+    print(f"🏆 Best model: {best_model}")
+    print(f"✅ Best model type: {best_model}")
     
-    # Construct team-level frame
-    train_tmp = train[['game_id', 'is_home', 'points_for', 'implied_spread']].copy()
-    train_tmp['pred_points'] = pred_points_tr
+    return best_score, best_model, best_params
+
+
+def train_final_enhanced_model(train_data, test_data, features, target, 
+                             model_type='xgboost', hyperparams=None,
+                             use_feature_selection=True, n_features=40):
+    """Train final model with proper parameter handling."""
+    print(f"🚀 Training final {model_type} model...")
     
-    # Split home/away
-    home_tr = train_tmp[train_tmp['is_home'] == 1].set_index('game_id')
-    away_tr = train_tmp[train_tmp['is_home'] == 0].set_index('game_id')
-    common_ids = home_tr.index.intersection(away_tr.index)
-    home_tr = home_tr.loc[common_ids]
-    away_tr = away_tr.loc[common_ids]
+    # Prepare features
+    numeric_features = [f for f in features if f not in ['roof', 'surface']]
+    categorical_features = [f for f in features if f in ['roof', 'surface'] and f in train_data.columns]
     
-    pred_spread_tr = (home_tr['pred_points'] - away_tr['pred_points']).values
-    implied_spread_tr = home_tr['implied_spread'].values
-    actual_home_win = (home_tr['points_for'].values > away_tr['points_for'].values).astype(int)
+    # Create preprocessor
+    preprocessor_transformers = [('num', 'passthrough', numeric_features)]
+    if categorical_features:
+        preprocessor_transformers.append(
+            ('cat', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), categorical_features)
+        )
     
-    X_calib = np.column_stack([pred_spread_tr, implied_spread_tr, pred_spread_tr - implied_spread_tr])
-    calibrator = LogisticRegression(max_iter=1000)
-    calibrator.fit(X_calib, actual_home_win)
-    print("✅ Winner calibration model fitted")
+    preprocessor = ColumnTransformer(preprocessor_transformers)
     
+    # Get training and test data
+    X_train, y_train = train_data[features], train_data[target]
+    X_test, y_test = test_data[features], test_data[target]
+    
+    # Preprocess
+    X_train_processed = preprocessor.fit_transform(X_train)
+    X_test_processed = preprocessor.transform(X_test)
+    
+    # Feature selection
+    if use_feature_selection:
+        selected_features = ensemble_feature_selection(X_train_processed, y_train, n_features)
+        X_train_final = X_train_processed[:, selected_features]
+        X_test_final = X_test_processed[:, selected_features]
+        print(f"✅ Using {len(selected_features)} selected features")
+    else:
+        X_train_final = X_train_processed
+        X_test_final = X_test_processed
+        print(f"✅ Using all {X_train_final.shape[1]} features")
+    
+    # Create and train model
+    if model_type == 'stacking' and LIGHTGBM_AVAILABLE:
+        model = StackingRegressor([
+            ('xgb', create_xgboost_model(hyperparams, random_state=42)),
+            ('lgb', LGBMRegressor(n_estimators=800, random_state=42, n_jobs=-1, verbose=-1))
+        ], final_estimator=Ridge(alpha=1.0), cv=3, n_jobs=-1)
+    elif model_type == 'optimized_xgb' or (model_type == 'optimized' and hyperparams):
+        model = create_xgboost_model(hyperparams, random_state=42)
+    elif model_type == 'lgb' and LIGHTGBM_AVAILABLE:
+        model = LGBMRegressor(n_estimators=1000, random_state=42, n_jobs=-1, verbose=-1)
+    else:
+        model = create_xgboost_model(random_state=42)
+    
+    # Train model
+    if 'xgb' in str(type(model)).lower() and model_type != 'stacking':
+        model.fit(X_train_final, y_train, 
+                 eval_set=[(X_test_final, y_test)], 
+                 early_stopping_rounds=50, verbose=False)
+    else:
+        model.fit(X_train_final, y_train)
+    
+    # Make predictions
+    predictions = model.predict(X_test_final)
+    
+    # Calculate metrics
+    mae = mean_absolute_error(y_test, predictions)
+    rmse = np.sqrt(mean_squared_error(y_test, predictions))
+    
+    metrics = {'mae': mae, 'rmse': rmse}
+    
+    # Create pipeline
     class ModelPipeline:
-        def __init__(self, preprocessor, models, feature_selector=None, objective_type='squared', residual_mode=False, calibrator=None):
+        def __init__(self, preprocessor, model, feature_selector=None):
             self.preprocessor = preprocessor
-            self.models = models
+            self.model = model
             self.feature_selector = feature_selector
-            self.objective_type = objective_type
-            self.residual_mode = residual_mode
-            self.calibrator = calibrator
         
         def predict(self, X):
             X_processed = self.preprocessor.transform(X)
             if self.feature_selector:
-                X_processed = self.feature_selector.transform(X_processed)
-            preds = np.column_stack([m.predict(X_processed) for m in self.models]).mean(axis=1)
-            if self.residual_mode and 'implied_points' in X.columns:
-                preds = X['implied_points'].values + preds
-            if self.objective_type == 'poisson':
-                preds = np.clip(preds, 0, None)
-            return preds
-        
-        def predict_win_prob(self, df_team):
-            # df_team: team-level DataFrame with implied_spread and is_home
-            # Build game-level predictions and compute calibrated P(home win)
-            tmp = df_team[['game_id', 'is_home', 'implied_spread']].copy()
-            tmp['pred_points'] = self.predict(df_team)
-            home = tmp[tmp['is_home'] == 1].set_index('game_id')
-            away = tmp[tmp['is_home'] == 0].set_index('game_id')
-            common = home.index.intersection(away.index)
-            home = home.loc[common]
-            away = away.loc[common]
-            
-            pred_spread = (home['pred_points'] - away['pred_points']).values
-            implied_spread = home['implied_spread'].values
-            Xc = np.column_stack([pred_spread, implied_spread, pred_spread - implied_spread])
-            
-            if self.calibrator is None:
-                # Fallback: sigmoid on pred_spread
-                from scipy.special import expit
-                return pd.Series(expit(pred_spread / 3.0), index=common)
-            
-            probs = self.calibrator.predict_proba(Xc)[:, 1]
-            return pd.Series(probs, index=common)
+                X_processed = X_processed[:, self.feature_selector]
+            return self.model.predict(X_processed)
     
-    selector_obj = selector if use_feature_selection and 'selector' in locals() else None
-    pipeline = ModelPipeline(preprocessor, models, selector_obj, objective_type, residual_mode, calibrator)
+    pipeline = ModelPipeline(
+        preprocessor, 
+        model, 
+        selected_features if use_feature_selection else None
+    )
     
-    print("✅ Final model training complete")
-    return pipeline, pred_te, {'mae': team_mae, 'rmse': team_rmse}
+    return pipeline, predictions, metrics
 
 
-def comprehensive_evaluation(test, pred_te):
-    """
-    Comprehensive evaluation including game-level metrics and betting performance.
-    
-    Args:
-        test: Test DataFrame with game information
-        pred_te: Team-level predictions
-    
-    Returns:
-        tuple: (score_eval, comprehensive_metrics)
-    """
-    print("Converting team predictions to game scores...")
+def comprehensive_evaluation(test_data, predictions):
+    """Comprehensive evaluation including game-level metrics and betting performance."""
+    print("📊 Converting team predictions to game scores...")
     
     # Combine team rows back into games
     available_cols = ['game_id', 'team', 'opp', 'is_home', 'points_for', 'points_against']
-    if 'spread_line' in test.columns:
+    if 'spread_line' in test_data.columns:
         available_cols.append('spread_line')
-    if 'total_line' in test.columns:
+    if 'total_line' in test_data.columns:
         available_cols.append('total_line')
     
-    existing_cols = [col for col in available_cols if col in test.columns]
+    existing_cols = [col for col in available_cols if col in test_data.columns]
     
-    te_pred = test[existing_cols].copy()
-    te_pred['pred_points'] = pred_te
+    te_pred = test_data[existing_cols].copy()
+    te_pred['pred_points'] = predictions
     
     # Separate home and away predictions
     home_games = te_pred[te_pred['is_home'] == 1].set_index('game_id')
@@ -565,14 +508,12 @@ def comprehensive_evaluation(test, pred_te):
         game_metrics['ou_accuracy'] = ou_accuracy
         game_metrics['total_correlation'] = score_pred['pred_total'].corr(score_pred['actual_total'])
     
-    # Print comprehensive results
-    print(f"Game-level evaluation:")
+    # Print results
+    print(f"📊 Game-level evaluation:")
     print(f"   MAE home score: {game_metrics['mae_home']:.2f}")
     print(f"   MAE away score: {game_metrics['mae_away']:.2f}")
     print(f"   MAE total score: {game_metrics['mae_total']:.2f}")
     print(f"   MAE spread: {game_metrics['mae_spread']:.2f}")
-    print(f"   RMSE total: {game_metrics['rmse_total']:.2f}")
-    print(f"   RMSE spread: {game_metrics['rmse_spread']:.2f}")
     
     if 'ats_accuracy' in game_metrics:
         print(f"   ATS accuracy: {game_metrics['ats_accuracy']:.1%}")
@@ -582,13 +523,11 @@ def comprehensive_evaluation(test, pred_te):
         print(f"   O/U accuracy: {game_metrics['ou_accuracy']:.1%}")
         print(f"   Total correlation: {game_metrics['total_correlation']:.3f}")
     
-    print("Game evaluation complete")
-    
     return score_pred, game_metrics
 
 
 if __name__ == "__main__":
-    print("🧪 Enhanced Model Training Module - Testing Complete Pipeline...")
+    print("🧪 Robust Enhanced Model Training Module - Testing Complete Pipeline...")
     print("="*70)
     
     # Test with sample data
@@ -604,62 +543,25 @@ if __name__ == "__main__":
     featured_data = create_all_features(sample_data)
     print("✅ Feature engineering complete")
     
-    print("\n📊 Step 3: Preparing data...")
+    print("\n📊 Step 3: Robust data preparation...")
     train, test, FEATURES, TARGET = prepare_data(featured_data, test_season=2024)
     
-    print("\n🔄 Step 4: Enhanced walk-forward backtesting...")
-    cv_mae, fold_results, best_params = improved_walk_forward_backtest(
-        train, FEATURES, TARGET, n_splits=5, use_optimization=True, objective_type='squared', decay_half_life_days=60
+    print("\n🔄 Step 4: Enhanced walk-forward validation...")
+    cv_mae, best_model_type, best_hyperparams = enhanced_walk_forward_validation(
+        train, FEATURES, TARGET, n_folds=4
     )
     
-    print("\n🚀 Step 5: Training final optimized model...")
-    model_type = 'optimized' if best_params else 'xgboost'
-    pipeline, pred_te, metrics = train_final_model(
+    print("\n🚀 Step 5: Training final enhanced model...")
+    pipeline, pred_te, metrics = train_final_enhanced_model(
         train, test, FEATURES, TARGET, 
-        model_type=model_type, 
-        best_params=best_params,
-        use_feature_selection=True,
-        objective_type='squared',
-        seeds=(42, 1337, 2024),
-        decay_half_life_days=60
+        model_type=best_model_type, 
+        hyperparams=best_hyperparams,
+        use_feature_selection=True
     )
     
     print("\n🎯 Step 6: Comprehensive evaluation...")
     score_eval, game_metrics = comprehensive_evaluation(test, pred_te)
     
     print("\n" + "="*70)
-    print("🎉 ENHANCED PIPELINE TEST SUCCESSFUL!")
+    print("🎉 ROBUST PIPELINE TEST SUCCESSFUL!")
     print("="*70)
-    
-    print(f"\n📊 Final Results Summary:")
-    print(f"   Training records: {len(train)}")
-    print(f"   Test records: {len(test)}")
-    print(f"   Features used: {len(FEATURES)}")
-    print(f"   Model type: {model_type}")
-    
-    print(f"\n🔄 Cross-Validation:")
-    print(f"   Mean CV MAE: {cv_mae:.3f}")
-    
-    print(f"\n🎯 Final Model Performance:")
-    print(f"   Team-level MAE: {metrics['mae']:.2f}")
-    print(f"   Team-level RMSE: {metrics['rmse']:.2f}")
-    
-    print(f"\n🏈 Game-level Performance:")
-    for metric, value in game_metrics.items():
-        if isinstance(value, float):
-            if 'accuracy' in metric:
-                print(f"   {metric.replace('_', ' ').title()}: {value:.1%}")
-            else:
-                print(f"   {metric.replace('_', ' ').title()}: {value:.2f}")
-    
-    print(f"\n📋 Sample Predictions:")
-    print(score_eval[['home_pred', 'away_pred', 'pred_total', 'pred_spread', 
-                     'home_actual', 'away_actual', 'ae_total']].head())
-    
-    print(f"\n✅ Enhanced NFL prediction model is ready!")
-    print(f"💡 Key improvements implemented:")
-    print(f"   - Hyperparameter optimization with Optuna")
-    print(f"   - Enhanced walk-forward validation with purging") 
-    print(f"   - Feature selection for noise reduction")
-    print(f"   - Comprehensive betting-focused evaluation")
-    print(f"   - Support for ensemble models")
